@@ -129,6 +129,7 @@
   ls                                           アップロード済み・検出済みの出力ファイル一覧
   cat <path>                                   ファイルを表示(出力は /files/ 配下)
   download <path>                              ファイルをダウンロード
+  probe [path...]                              出力ファイル候補の有無・サイズ・先頭を診断表示
   clear                                        画面クリア
 <command>: percent / path / setup / ren / spin / cover / util / verify
   java -jar sfinder.jar -v      バージョン表示
@@ -213,6 +214,18 @@
       if (!uploaded.size && !known.size) print('(なし)\n', 'dim');
       for (const f of uploaded.values()) print(`${f.path}  ${(f.size / 1024).toFixed(1)} KB${f.isJar ? '  [JAR]' : ''}\n`, 'dim');
       for (const p of known) print(`${p}  [出力]\n`, 'dim');
+      return;
+    }
+    if (head === 'probe') {
+      await ensureInit();
+      const cands = new Set(['output/setup.html', 'output/last_output.txt', ...t.slice(1), ...known]);
+      for (const p of cands) {
+        const full = fullPath(p);
+        try {
+          const b = await cjFileBlob(full); const s = b ? await b.text() : '';
+          print(`${full}: ${b ? b.size : 0} bytes\n  先頭: ${JSON.stringify(s.slice(0, 120))}\n`, 'dim');
+        } catch (e) { print(`${full}: 読めません (${e && e.message || e})\n`, 'dim'); }
+      }
       return;
     }
     if (head === 'cat' || head === 'download' || head === 'get') {

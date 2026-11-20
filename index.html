@@ -120,6 +120,15 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
   }
 
+  function htmlUrl(r) { return URL.createObjectURL(new Blob([r.blob], { type: 'text/html' })); }
+  function printHtmlLink(r) {
+    print(`\n[HTML] ${r.full} (${(r.blob.size / 1024).toFixed(1)} KB)  `, 'ok');
+    const a = document.createElement('a');
+    a.href = htmlUrl(r); a.textContent = '新しいタブで開く'; a.target = '_blank'; a.rel = 'noopener';
+    term.appendChild(a);
+    print(`  / download ${r.full} で保存\n`, 'dim');
+  }
+
   // ---------- コマンド ----------
   const HELP =
 `使い方:
@@ -129,6 +138,7 @@
   ls                                           アップロード済み・検出済みの出力ファイル一覧
   cat <path>                                   ファイルを表示(出力は /files/ 配下)
   download <path>                              ファイルをダウンロード
+  open <path>                                  HTMLファイルを新しいタブで開くリンクを表示
   probe [path...]                              出力ファイル候補の有無・サイズ・先頭を診断表示
   clear                                        画面クリア
 <command>: percent / path / setup / ren / spin / cover / util / verify
@@ -179,7 +189,15 @@
     const o = argVal(args, ['-o', '--output-base']);
     const lp = argVal(args, ['-lp', '--log-path']);
     const mains = [];                               // 内容を表示する候補
-    if (o !== '-') { if (o) mains.push(o); else if (sub === 'setup') mains.push('output/setup.html'); }
+    const dirOf = p => p.includes('/') ? p.slice(0, p.lastIndexOf('/') + 1) : '';
+    if (o !== '-') {
+      if (sub === 'setup') mains.push(o || 'output/setup.html');
+      else if (sub === 'path') {
+        // path は -o(既定 output/path.csv)と同じ場所に path_unique.html / path_minimal.html を作る想定(非公式資料に基づく)
+        const base = o || 'output/path.csv'; const d = dirOf(base);
+        mains.push(d + 'path_unique.html', d + 'path_minimal.html', base);
+      } else if (o) mains.push(o);
+    }
     const extras = [];                               // 存在だけ知らせる候補
     extras.push(lp || 'output/last_output.txt');
     for (const m of stdout.matchAll(/(?:\/files\/)?output\/[\w.\-\/]+\.\w+/g)) extras.push(m[0]);
@@ -188,7 +206,7 @@
     for (const p of mains) {
       const r = await tryBlob(p); if (!r || seen.has(r.full)) continue;
       seen.add(r.full); known.add(r.full); shown++;
-      await showOutput(r, 60000);
+      if (/\.html?$/i.test(r.full)) printHtmlLink(r); else await showOutput(r, 60000);
     }
     const found = [];
     for (const p of extras) {
@@ -218,7 +236,8 @@
     }
     if (head === 'probe') {
       await ensureInit();
-      const cands = new Set(['output/setup.html', 'output/last_output.txt', ...t.slice(1), ...known]);
+      const cands = new Set(['output/setup.html', 'output/path_unique.html', 'output/path_minimal.html', 'output/path.csv',
+                             'output/last_output.txt', 'output/error.txt', ...t.slice(1), ...known]);
       for (const p of cands) {
         const full = fullPath(p);
         try {
@@ -228,12 +247,318 @@
       }
       return;
     }
-    if (head === 'cat' || head === 'download' || head === 'get') {
+    if (head === 'cat' || head === 'download' || head === 'get' || head === 'open') {
       if (!t[1]) { print('パスを指定してください\n', 'err'); return; }
       await ensureInit();
       const r = await tryBlob(t[1]);
       if (!r) { print(`${t[1]} が見つからないか空です(出力は /files/ 配下)\n`, 'err'); return; }
-      if (head === 'cat') await showOutput(r, 0); else { download(r); print(`[ダウンロード] ${r.full}\n`, 'ok'); }
+      if (head === 'cat') await showOutput(r, 0);
+      else if (head === 'open') printHtmlLink(r);
+      else { download(r); print(`[ダウンロード] ${r.full}\n`, 'ok'); }
+      return;
+    }
+
+    let jarName, args;
+    if (head === 'java') {
+      if (t[1] !== '-jar' || !t[2]) { print('対応形式: java -jar <jar名> [引数...]\n', 'err'); return; }
+      const given = t[2].replace(/^.*[\\/]/, '');
+      if (uploaded.has(given) && uploaded.get(given).isJar) jarName = given;
+      else {
+        const jars = [...uploaded].filter(([, f]) => f.isJar).map(([n]) => n);
+        if (jars.length === 1) { jarName = jars[0]; print(`[${given} は未アップロード。${jarName} を使用します]\n`, 'dim'); }
+        else { print(`${t[2]} がアップロードされていません。upload でJARを追加してください。\n`, 'err'); return; }
+      }
+      args = t.slice(3);
+    } else if (head === 'sfinder') {
+      const jars = [...uploaded].filter(([, f]) => f.isJar).map(([n]) => n);
+      if (jars.length !== 1) { print(jars.length ? 'JARが複数あります。java -jar <名前> で指定してください。\n' : 'JARがありません。upload で追加してください。\n', 'err'); return; }
+      jarName = jars[0]; args = t.slice(1);
+    } else { print(`'${t[0]}' は使用できません。help を参照してください。\n`, 'err'); return; }
+
+    if (!args.length) { print('<command> を指定してください(例: setup)。help を参照。\n', 'err'); return; }
+    await runSfinder(jarName, args);
+  }
+
+  async function submit() {
+    if (busy) return;
+    const v = cmdEl.value; cmdEl.value = '';
+    busy = true; cmdEl.disabled = true;
+    try { await exec(v); } catch (e) { print('エラー: ' + e + '\n', 'err'); }
+    busy = false; cmdEl.disabled = false; cmdEl.focus();
+  }
+  cmdEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter') submit();
+    else if (e.key === 'ArrowUp' && history.length) { hIdx = Math.max(0, hIdx - 1); cmdEl.value = history[hIdx]; e.preventDefault(); }
+    else if (e.key === 'ArrowDown' && history.length) { hIdx = Math.min(history.length, hIdx + 1); cmdEl.value = history[hIdx] || ''; e.preventDefault(); }
+  });
+  term.addEventListener('click', () => { if (!getSelection().toString()) cmdEl.focus(); });
+
+  // ---------- 起動 ----------
+  print('solution-finder Web Terminal\n', 'ok');
+  print('help でコマンド一覧。sfinder.jar をこの画面にドラッグ&ドロップ、または upload で追加してください。\n', 'dim');
+  print('[JVM(CheerpJ)を初期化中…初回は時間がかかることがあります]\n', 'dim');
+  ensureInit().then(() => { print('[準備完了]\n', 'ok'); cmdEl.disabled = false; cmdEl.focus(); })
+              .catch(e => print('JVMの初期化に失敗しました: ' + e + '\n(http(s)で開いているか、ネットワークを確認してください)\n', 'err'));
+})();
+</script>
+</body>
+</html><!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>solution-finder Web Terminal</title>
+<!-- CheerpJ 5.0 ローダー(公式CDN)。http(s)で配信して開くこと -->
+<script src="https://cjrtnc.leaningtech.com/5.0/loader.js"></script>
+<style>
+  :root { --bg:#0c0f14; --fg:#d6dde6; --dim:#7f8b9b; --acc:#4fb3ff; --ok:#7bd88f; --err:#ff7b7b; --line:#232b36; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); }
+  body { display:flex; flex-direction:column; font:13px/1.55 ui-monospace,Consolas,"Cascadia Mono",monospace; }
+  #term { flex:1; overflow:auto; padding:14px 16px; white-space:pre-wrap; word-break:break-all; }
+  #bar { display:flex; align-items:center; gap:8px; padding:8px 16px 12px; border-top:1px solid var(--line); }
+  #prompt { color:var(--acc); }
+  #cmd { flex:1; background:transparent; color:var(--fg); border:0; outline:0; font:inherit; }
+  .cmd { color:var(--acc); } .ok { color:var(--ok); } .err { color:var(--err); } .dim { color:var(--dim); }
+  a { color:var(--acc); }
+  body.drag #term { outline:2px dashed var(--acc); outline-offset:-8px; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<div id="bar"><span id="prompt">&gt;</span><input id="cmd" type="text" autocomplete="off" spellcheck="false" autofocus disabled><input id="picker" type="file" multiple hidden></div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const term = $('term'), cmdEl = $('cmd'), picker = $('picker');
+  const uploaded = new Map();            // 名前 -> {path,size,isJar}
+  const known = new Set();               // 実行で見つかった出力ファイル(絶対パス)
+  const history = []; let hIdx = 0, busy = false, cjReady = null;
+  const SUBS = ['percent', 'path', 'setup', 'ren', 'spin', 'cover'];
+
+  // CheerpJ標準出力の受け皿(非表示)
+  const javaConsole = document.createElement('div');
+  javaConsole.id = 'console'; javaConsole.style.display = 'none';
+  document.body.appendChild(javaConsole);
+
+  // ---------- 表示 ----------
+  function print(text, cls) {
+    const wrap = document.createElement('span');
+    if (cls) wrap.className = cls;
+    const re = /https?:\/\/[^\s<>"']+/g; let last = 0, m;
+    while ((m = re.exec(text))) {
+      wrap.append(text.slice(last, m.index));
+      const a = document.createElement('a');
+      a.href = m[0]; a.textContent = m[0]; a.target = '_blank'; a.rel = 'noopener noreferrer';
+      wrap.append(a); last = m.index + m[0].length;
+    }
+    wrap.append(text.slice(last));
+    term.appendChild(wrap);
+    term.scrollTop = term.scrollHeight;
+  }
+  const nl = t => t.endsWith('\n') ? t : t + '\n';
+
+  // ---------- JVM ----------
+  function ensureInit() {
+    if (!cjReady) {
+      // version は 8 / 11 / 17 など。sfinderが起動しない場合に変更して再読み込み
+      cjReady = cheerpjInit({ version: 8 });
+    }
+    return cjReady;
+  }
+
+  // ---------- ファイル追加 ----------
+  async function addFiles(files) {
+    await ensureInit();
+    for (const f of files) {
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      cheerpOSAddStringFile('/str/' + f.name, bytes);
+      const isJar = /\.jar$/i.test(f.name);
+      uploaded.set(f.name, { path: '/str/' + f.name, size: f.size, isJar });
+      print(`[追加] /str/${f.name} (${(f.size / 1024).toFixed(1)} KB)${isJar ? ' [JAR]' : ''}\n`, 'ok');
+    }
+  }
+  picker.addEventListener('change', async () => { await addFiles(picker.files); picker.value = ''; cmdEl.focus(); });
+  addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
+  addEventListener('dragleave', () => document.body.classList.remove('drag'));
+  addEventListener('drop', async e => {
+    e.preventDefault(); document.body.classList.remove('drag');
+    if (e.dataTransfer.files.length) await addFiles(e.dataTransfer.files);
+  });
+
+  // ---------- パース ----------
+  function tokenize(line) {
+    const out = []; let cur = '', q = null, has = false;
+    for (const ch of line) {
+      if (q) { if (ch === q) q = null; else cur += ch; }
+      else if (ch === '"' || ch === "'") { q = ch; has = true; }
+      else if (/\s/.test(ch)) { if (cur || has) { out.push(cur); cur = ''; has = false; } }
+      else cur += ch;
+    }
+    if (cur || has) out.push(cur);
+    return out;
+  }
+  const hasOpt = (args, names) => args.some(a => names.includes(a));
+  const argVal = (args, names) => { for (let i = 0; i < args.length - 1; i++) if (names.includes(args[i])) return args[i + 1]; return null; };
+
+  // ---------- 出力ファイル ----------
+  const fullPath = p => p.startsWith('/') ? p : '/files/' + p;
+  async function tryBlob(p) {
+    const full = fullPath(p);
+    try { const b = await cjFileBlob(full); if (b && b.size > 0) return { full, blob: b }; } catch (e) { /* 無い */ }
+    return null;
+  }
+  async function showOutput(r, limit) {
+    let text = await r.blob.text(); let cut = false;
+    if (limit && text.length > limit) { text = text.slice(0, limit); cut = true; }
+    print(`\n--- ${r.full} (${(r.blob.size / 1024).toFixed(1)} KB) ---\n`, 'dim');
+    print(nl(text));
+    if (cut) print(`(先頭 ${limit} 文字のみ表示。全体は download ${r.full} で取得)\n`, 'dim');
+    print('---\n', 'dim');
+  }
+  function download(r) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(r.blob); a.download = r.full.replace(/^.*\//, '') || 'output.txt';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+
+  function htmlUrl(r) { return URL.createObjectURL(new Blob([r.blob], { type: 'text/html' })); }
+  function printHtmlLink(r) {
+    print(`\n[HTML] ${r.full} (${(r.blob.size / 1024).toFixed(1)} KB)  `, 'ok');
+    const a = document.createElement('a');
+    a.href = htmlUrl(r); a.textContent = '新しいタブで開く'; a.target = '_blank'; a.rel = 'noopener';
+    term.appendChild(a);
+    print(`  / download ${r.full} で保存\n`, 'dim');
+  }
+
+  // ---------- コマンド ----------
+  const HELP =
+`使い方:
+  java -jar sfinder.jar <command> [options]    solution-finderを実行
+  sfinder <command> [options]                  同上(アップロード済みJARが1つのとき)
+  upload                                       ファイル選択を開く(ドラッグ&ドロップでも追加可)
+  ls                                           アップロード済み・検出済みの出力ファイル一覧
+  cat <path>                                   ファイルを表示(出力は /files/ 配下)
+  download <path>                              ファイルをダウンロード
+  open <path>                                  HTMLファイルを新しいタブで開くリンクを表示
+  probe [path...]                              出力ファイル候補の有無・サイズ・先頭を診断表示
+  clear                                        画面クリア
+<command>: percent / path / setup / ren / spin / cover / util / verify
+  java -jar sfinder.jar -v      バージョン表示
+  java -jar sfinder.jar -h      Usage表示
+  java -jar sfinder.jar <command> -h   各コマンドのオプション一覧
+例:
+  java -jar sfinder.jar setup --tetfu v115@HhUpxhBeA81hCeA8yhD8AeB8JeAgH --patterns *! --fill i --margin o
+
+メモ:
+  ・field.txt / patterns.txt をアップロード済みで、-t/-fp(-p/-pp)を指定していなければ、
+    -fp /str/field.txt、-pp /str/patterns.txt を自動で補います(実行前に表示します)。
+  ・実行後、-o / -lp の出力先と、標準出力に出た output/... のパスを探して表示します。
+  ・Javaが書き込めるのは /files/ 配下です。出力先を指定するなら例: -o /files/out/setup.html
+`;
+
+  async function runSfinder(jarName, args) {
+    const sub = args[0];
+    const injected = [];
+    if (SUBS.includes(sub)) {
+      if (!hasOpt(args, ['-t', '--tetfu', '-fp', '--field-path']) && uploaded.has('field.txt')) { args.push('-fp', '/str/field.txt'); injected.push('-fp /str/field.txt'); }
+      if (!hasOpt(args, ['-p', '--patterns', '-pp', '--patterns-path']) && uploaded.has('patterns.txt')) { args.push('-pp', '/str/patterns.txt'); injected.push('-pp /str/patterns.txt'); }
+    }
+    if (injected.length) print(`[自動補完] ${injected.join(' ')}\n`, 'dim');
+
+    await ensureInit();
+    const before = javaConsole.textContent.length;
+    const buf = [];
+    const orig = { log: console.log, error: console.error, warn: console.warn };
+    for (const k of Object.keys(orig)) console[k] = (...a) => { buf.push(a.join(' ')); orig[k].apply(console, a); };
+
+    print('[実行中…]\n', 'dim');
+    const t0 = performance.now();
+    let rc, thrown = null;
+    try { rc = await cheerpjRunJar('/str/' + jarName, ...args); }
+    catch (e) { thrown = e; }
+    finally { Object.assign(console, orig); }
+
+    const elText = javaConsole.textContent.slice(before);
+    const stdout = elText || buf.join('\n');
+    if (stdout) print(nl(stdout));
+    if (thrown) print('実行エラー: ' + (thrown && thrown.message || thrown) + '\n', 'err');
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
+    print(`[終了コード: ${thrown ? '-' : rc} / ${sec}秒]\n`, thrown || rc ? 'err' : 'ok');
+    if (thrown) return;
+
+    // 出力ファイルの探索
+    const o = argVal(args, ['-o', '--output-base']);
+    const lp = argVal(args, ['-lp', '--log-path']);
+    const mains = [];                               // 内容を表示する候補
+    const dirOf = p => p.includes('/') ? p.slice(0, p.lastIndexOf('/') + 1) : '';
+    if (o !== '-') {
+      if (sub === 'setup') mains.push(o || 'output/setup.html');
+      else if (sub === 'path') {
+        // path は -o(既定 output/path.csv)と同じ場所に path_unique.html / path_minimal.html を作る想定(非公式資料に基づく)
+        const base = o || 'output/path.csv'; const d = dirOf(base);
+        mains.push(d + 'path_unique.html', d + 'path_minimal.html', base);
+      } else if (o) mains.push(o);
+    }
+    const extras = [];                               // 存在だけ知らせる候補
+    extras.push(lp || 'output/last_output.txt');
+    for (const m of stdout.matchAll(/(?:\/files\/)?output\/[\w.\-\/]+\.\w+/g)) extras.push(m[0]);
+
+    const seen = new Set(); let shown = 0;
+    for (const p of mains) {
+      const r = await tryBlob(p); if (!r || seen.has(r.full)) continue;
+      seen.add(r.full); known.add(r.full); shown++;
+      if (/\.html?$/i.test(r.full)) printHtmlLink(r); else await showOutput(r, 60000);
+    }
+    const found = [];
+    for (const p of extras) {
+      const r = await tryBlob(p); if (!r || seen.has(r.full)) continue;
+      seen.add(r.full); known.add(r.full); found.push(r.full);
+    }
+    if (found.length) print(`[他の出力ファイル] ${found.join(', ')}\n  → cat <path> で表示 / download <path> で保存\n`, 'dim');
+    if (!shown && !found.length && !['-v', '-h', '--version', '--help'].includes(sub) && !args.includes('-h')) {
+      print('[出力ファイルは見つかりませんでした] 出力先を -o /files/xxx で明示するか、cat <path> で直接確認してください。\n', 'dim');
+    }
+  }
+
+  async function exec(line) {
+    line = line.trim(); if (!line) return;
+    history.push(line); hIdx = history.length;
+    print('> ' + line + '\n', 'cmd');
+    const t = tokenize(line); const head = t[0].toLowerCase();
+
+    if (head === 'clear' || head === 'cls') { term.textContent = ''; return; }
+    if (head === 'help' || head === '?') { print(HELP, 'dim'); return; }
+    if (head === 'upload') { picker.click(); return; }
+    if (head === 'ls' || head === 'dir') {
+      if (!uploaded.size && !known.size) print('(なし)\n', 'dim');
+      for (const f of uploaded.values()) print(`${f.path}  ${(f.size / 1024).toFixed(1)} KB${f.isJar ? '  [JAR]' : ''}\n`, 'dim');
+      for (const p of known) print(`${p}  [出力]\n`, 'dim');
+      return;
+    }
+    if (head === 'probe') {
+      await ensureInit();
+      const cands = new Set(['output/setup.html', 'output/path_unique.html', 'output/path_minimal.html', 'output/path.csv',
+                             'output/last_output.txt', 'output/error.txt', ...t.slice(1), ...known]);
+      for (const p of cands) {
+        const full = fullPath(p);
+        try {
+          const b = await cjFileBlob(full); const s = b ? await b.text() : '';
+          print(`${full}: ${b ? b.size : 0} bytes\n  先頭: ${JSON.stringify(s.slice(0, 120))}\n`, 'dim');
+        } catch (e) { print(`${full}: 読めません (${e && e.message || e})\n`, 'dim'); }
+      }
+      return;
+    }
+    if (head === 'cat' || head === 'download' || head === 'get' || head === 'open') {
+      if (!t[1]) { print('パスを指定してください\n', 'err'); return; }
+      await ensureInit();
+      const r = await tryBlob(t[1]);
+      if (!r) { print(`${t[1]} が見つからないか空です(出力は /files/ 配下)\n`, 'err'); return; }
+      if (head === 'cat') await showOutput(r, 0);
+      else if (head === 'open') printHtmlLink(r);
+      else { download(r); print(`[ダウンロード] ${r.full}\n`, 'ok'); }
       return;
     }
 
